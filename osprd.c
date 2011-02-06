@@ -181,6 +181,7 @@ static int osprd_close_last(struct inode *inode, struct file *filp)
 }
 
 
+//FIX:what if signal happened after spinlock was obtained???
 int write_lock_condition(osprd_info_t* d) {
     osp_spin_lock(&d->mutex);
     if(!d->num_write_locks && !d->num_read_locks) {
@@ -281,11 +282,24 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
                 osp_spin_unlock(&d->mutex); //Release the lock
                 //Exiting critical section
 
+
+                //FIX: testing code 
+                /*
+                eprintk("About to wait. Here are some stats:\n");
+                eprintk("Num_write_locks:%d\n",d->num_write_locks);
+                eprintk("Num_read_locks:%d\n",d->num_read_locks);
+                eprintk("Ticket head:%d\n",d->ticket_head);
+                eprintk("Ticket tail:%d\n",d->ticket_tail);
+                */
+
+
                 if(filp_writable) { //FIX: extensively test that write_lock_condition and read_lock_condit works
 	            int ret = wait_event_interruptible(d->blockq, request_ticket == d->ticket_head 
                                                  && write_lock_condition(d) ); //Block until turn to run
-                    if(ret == -ERESTARTSYS)
+                    if(ret == -ERESTARTSYS) {
+                        d->ticket_head++;
                         return ret;  
+                    }
 
                     //Secure the write lock
                     d->num_write_locks++; 
@@ -299,8 +313,10 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
                 } else { //Attempt to read-lock the disk
                     int ret = wait_event_interruptible(d->blockq, request_ticket == d->ticket_head 
                                                  && read_lock_condition(d) ); //Block until turn to run
-                    if(ret == -ERESTARTSYS)
+                    if(ret == -ERESTARTSYS) {
+                        d->ticket_head++;
                         return ret;
+                    }
                 
                     //Secure a read lock
                     d->num_read_locks++;
