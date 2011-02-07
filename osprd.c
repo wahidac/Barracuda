@@ -37,7 +37,7 @@ MODULE_DESCRIPTION("CS 111 RAM Disk");
 MODULE_AUTHOR("Skeletor");
 
 #define OSPRD_MAJOR	222
-
+#define MAX_TICKET_SIZE 100
 /* This module parameter controls how big the disk will be.
  * You can specify module parameters when you load the module,
  * as an argument to insmod: "insmod osprd.ko nsectors=4096" */
@@ -64,6 +64,8 @@ typedef struct osprd_info {
 
         unsigned int num_read_locks;    // How many threads have a read lock on this device
         unsigned int num_write_locks;   // How many threads have a write lock on this device (can't be more than 1)
+		
+	unsigned dead_ticket[MAX_TICKET_SIZE];
 
 	/* HINT: You may want to add additional fields to help
 	         in detecting deadlock. */
@@ -232,9 +234,6 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
                                         //Only allow request to proceed when
                                         //it is its turn
 
-	DEFINE_WAIT(wait);                   // Defines a wait_queue_t object named wait.
-	wait.func = &default_wake_function;  // This wait object will be passed to finish_wait().
-		
 	// is file open for writing?
 	int filp_writable = (filp->f_mode & FMODE_WRITE) != 0;
 
@@ -292,6 +291,15 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
                 //Exiting critical section
 
                 if(filp_writable) { //FIX: extensively test that write_lock_condition and read_lock_condit works
+			
+		    // Check for dead tickets.
+		    if(d->dead_ticket[d->ticket_head]) {
+			// Get rid of dead ticket.
+			d->dead_ticket[d->ticket_head] = 0;
+			// Advance ticket head.
+			d->ticket_head++;
+		    }
+
 	            int ret = wait_event_interruptible(d->blockq, request_ticket == d->ticket_head 
                                                  && write_lock_condition(d) ); //Block until turn to run
 		    // Check if the current task received a signal before the above condition is true.
@@ -303,18 +311,22 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
 			// Entering critical section:
 			osp_spin_lock(&d->mutex);
 			
+			// If this task is supposed to run, let
+			// the next one run because this one was
+			// interrupted.
                         if(request_ticket == d->ticket_head) 
 				d->ticket_head++;
 			
-			// Exiting critical section:
-			osp_spin_unlock(&d->mutex);
-
 			// Otherwise, remove the current task from the wait queue
 			// so that it doesn't block the following processes in the 
 			// wait queue.
-			if(request_ticket != d->ticket_head) 
-				finish_wait(&d->blockq, &wait);
-                        return ret;  
+			if(request_ticket != d->ticket_head)  
+				d->dead_ticket[request_ticket] = 1;
+
+			// Exiting critical section:
+			osp_spin_unlock(&d->mutex);
+			
+                        return ret;
                     }
 
                     //Secure the write lock
@@ -327,6 +339,15 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
                     //Release mutex acquired during the call to write_lock_condition above
                     osp_spin_unlock(&d->mutex);
                 } else { //Attempt to read-lock the disk
+
+		    // Check for dead tickets.
+		    if(d->dead_ticket[d->ticket_head]) {
+			// Get rid of dead ticket
+			d->dead_ticket[d->ticket_head] = 0;
+			// Advance ticket head
+			d->ticket_head++;
+		    }	
+			 
                     int ret = wait_event_interruptible(d->blockq, request_ticket == d->ticket_head 
                                                  && read_lock_condition(d) ); //Block until turn to run
 		
@@ -338,19 +359,24 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
 			
 			// Entering critical section:
 			osp_spin_lock(&d->mutex);
-	
+			
+			// If current task is supposed to run
+			// let the next task run because this one 
+			// was interrupted.	
                         if(request_ticket == d->ticket_head) 
 				d->ticket_head++;
 				
-			// Exiting critical section:
-			osp_spin_unlock(&d->mutex);
-
 			// Otherwise, remove the current task from the wait queue 
 			// so that it doesn't block the following processes in the
 			// wait queue.
-			if(request_ticket != d->ticket_head)
-				finish_wait(&d->blockq, &wait);
-                        return ret;
+			if(request_ticket != d->ticket_head) {
+				d->dead_ticket[request_ticket] = 1;
+			}
+			// Exiting critical section:
+			osp_spin_unlock(&d->mutex);
+
+                        return ret; 
+			
                     }
                 
                     //Secure a read lock
@@ -442,6 +468,13 @@ static void osprd_setup(osprd_info_t *d)
 	/* Add code here if you add fields to osprd_info_t. */
         d->num_read_locks = 0;
         d->num_write_locks = 0;
+	
+	// Initialize dead ticket array to all 0's.
+	int i = 0;
+	for(i = 0; i < MAX_TICKET_SIZE; i++) {
+		d->dead_ticket[i] = 0;	
+	}
+	
 }
 
 
