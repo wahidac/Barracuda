@@ -317,9 +317,8 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
                         if(request_ticket == d->ticket_head) 
 				d->ticket_head++;
 			
-			// Otherwise, remove the current task from the wait queue
-			// so that it doesn't block the following processes in the 
-			// wait queue.
+			// Otherwise, make note that this request_ticket is dead
+			// by changing the dead_ticket array value to 1 instead of 0.
 			if(request_ticket != d->ticket_head)  
 				d->dead_ticket[request_ticket] = 1;
 
@@ -366,9 +365,8 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
                         if(request_ticket == d->ticket_head) 
 				d->ticket_head++;
 				
-			// Otherwise, remove the current task from the wait queue 
-			// so that it doesn't block the following processes in the
-			// wait queue.
+			// Otherwise, make note that this request_ticket is dead.
+			// by changing the array value to 1 instead of 0.
 			if(request_ticket != d->ticket_head) {
 				d->dead_ticket[request_ticket] = 1;
 			}
