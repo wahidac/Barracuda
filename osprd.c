@@ -34,7 +34,7 @@
 MODULE_LICENSE("Dual BSD/GPL");
 MODULE_DESCRIPTION("CS 111 RAM Disk");
 // EXERCISE: Pass your names into the kernel as the module's authors.
-MODULE_AUTHOR("Skeletor");
+MODULE_AUTHOR("Alvin Huynh and Wahid Chowdhury");
 
 #define OSPRD_MAJOR	222
 #define MAX_TICKET_SIZE 100
@@ -44,6 +44,7 @@ MODULE_AUTHOR("Skeletor");
 static int nsectors = 32;
 module_param(nsectors, int, 0);
 
+int deadlock = 0;
 
 /* The internal representation of our device. */
 typedef struct osprd_info {
@@ -65,7 +66,16 @@ typedef struct osprd_info {
         unsigned int num_read_locks;    // How many threads have a read lock on this device
         unsigned int num_write_locks;   // How many threads have a write lock on this device (can't be more than 1)
 		
-	unsigned dead_ticket[MAX_TICKET_SIZE];
+	
+	unsigned dead_ticket[MAX_TICKET_SIZE];  // Array of dead tickets. dead_ticket[i] = 1 means that there is a dead ticket
+						// at ticket_number i.  Otherwise, there is no dead ticket.
+
+	pid_t blocked_processes[MAX_TICKET_SIZE]; // Array of blocked processes.
+	
+	pid_t locked_processes[MAX_TICKET_SIZE];  // Array of processes holding locks.
+
+	int num_blocked_processes;      // Stores the number of currently blocked processes.
+	int num_locked_processes;       // Stores the number of currently locked processes.
 
 	/* HINT: You may want to add additional fields to help
 	         in detecting deadlock. */
@@ -83,6 +93,12 @@ static osprd_info_t osprds[NOSPRD];
 
 
 // Declare useful helper functions
+
+void deadlock_detection(pid_t p, int device);
+
+void deadlock_detection_helper(pid_t p1, pid_t p2);
+
+int get_device_num(osprd_info_t *d);
 
 /*
  * file2osprd(filp)
@@ -173,6 +189,9 @@ static int osprd_close_last(struct inode *inode, struct file *filp)
                     osp_spin_lock(&d->mutex);
                     filp->f_flags &= ~F_OSPRD_LOCKED;
                      
+		    // Remove the current process from the holding lock array.
+	            d->locked_processes[current->pid] = 0;
+
                     if(filp_writable) 
                         d->num_write_locks--;
                     else
@@ -214,8 +233,40 @@ int read_lock_condition(osprd_info_t* d) {
     }
 }
 
+// Returns the device number associated with osprd_info_t struct
+int get_device_num(osprd_info_t* d) {
+	return d->gd->first_minor;
+}
 
+void deadlock_detection(pid_t p, int device) {
 
+	int i = 0;
+	
+	// For each process p in device's holding array
+	for(i = 0; i < MAX_TICKET_SIZE; i++) {
+		if(osprds[device].locked_processes[i])
+			deadlock_detection_helper(p, osprds[device].locked_processes[i]);
+	}
+}
+
+void deadlock_detection_helper(pid_t p1, pid_t p2) {
+	
+	// Check if process is blocked by itself.
+	if(p1 == p2) {
+		deadlock = 1;	
+		return;
+	}
+
+	int i = 0;
+	int j = 0;
+	// For each device X
+	for(i = 0; i < NOSPRD ; i++) {
+		for(j = 0; j < MAX_TICKET_SIZE; j++) {
+			if(osprds[i].blocked_processes[j] == p2)
+				deadlock_detection(p1, i);
+		}
+	}
+}
 
 /*
  * osprd_lock
@@ -299,9 +350,49 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
 			// Advance ticket head.
 			d->ticket_head++;
 		    }
+		
+		    // Entering critical section.
+                    osp_spin_lock(&d->mutex); 
+		    // Add current process to blocking array.
+		    d->blocked_processes[d->num_blocked_processes++] = current->pid;
+
+		    // Check for any deadlocks.
+		    deadlock_detection(current->pid, get_device_num(d));
+		
+		    if(deadlock) {
+			// Remove this process from being blocked.
+			d->blocked_processes[--d->num_blocked_processes] = 0;
+			// Reset deadlock status.
+			deadlock = 0;
+			// Fix tickets.
+			
+			// If this task is supposed to run, let
+			// the next one run because this one was
+			// interrupted.
+                        if(request_ticket == d->ticket_head) 
+				d->ticket_head++;
+			
+			// Otherwise, make note that this request_ticket is dead
+			// by changing the dead_ticket array value to 1 instead of 0.
+			if(request_ticket != d->ticket_head)  
+				d->dead_ticket[request_ticket] = 1;
+
+			// Unlock spinlock.
+			osp_spin_unlock(&d->mutex);
+			// Return immediately.
+			return -EDEADLK;
+		    } 
+		    
+		    // Finishing critical section.
+		    osp_spin_unlock(&d->mutex);
 
 	            int ret = wait_event_interruptible(d->blockq, request_ticket == d->ticket_head 
                                                  && write_lock_condition(d) ); //Block until turn to run
+		    
+		    // Remove process from blocking array.
+                    d->blocked_processes[--d->num_blocked_processes] = 0;
+
+
 		    // Check if the current task received a signal before the above condition is true.
                     if(ret == -ERESTARTSYS) {
 			// If it is this task's turn in the wait queue,
@@ -327,7 +418,10 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
 			
                         return ret;
                     }
-
+		
+		    // Add current process to lock holding array
+		    d->locked_processes[d->num_locked_processes++] = current->pid;
+			
                     //Secure the write lock
                     d->num_write_locks++; 
                     filp->f_flags |= F_OSPRD_LOCKED;
@@ -347,9 +441,50 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
 			d->ticket_head++;
 		    }	
 			 
+
+		    // Entering critical section.
+                    osp_spin_lock(&d->mutex); 
+
+		    // Add current process to blocking array.
+		    d->blocked_processes[d->num_blocked_processes++] = current->pid;
+
+ 		    // Need to check if locking this process will create a deadlock.
+		    // If so then return -EDEADLK.  Otherwise proceed.		
+		    deadlock_detection(current->pid, get_device_num(d));
+
+	   	    if(deadlock) {
+			// Remove this process from blocked array.
+			d->blocked_processes[--d->num_blocked_processes] = 0;
+			// Reset deadlock status.
+			deadlock = 0;
+			// Fix  tickets.
+			// If this task is supposed to run, let
+			// the next one run because this one was
+			// interrupted.
+                        if(request_ticket == d->ticket_head) 
+				d->ticket_head++;
+			
+			// Otherwise, make note that this request_ticket is dead
+			// by changing the dead_ticket array value to 1 instead of 0.
+			if(request_ticket != d->ticket_head)  
+				d->dead_ticket[request_ticket] = 1;
+
+			// Unlock spinlock.
+			osp_spin_unlock(&d->mutex);
+			// Return immediately.
+			return -EDEADLK; 			        
+		    }	
+
+		    // Finishing critical section.
+		    osp_spin_unlock(&d->mutex);
+
                     int ret = wait_event_interruptible(d->blockq, request_ticket == d->ticket_head 
                                                  && read_lock_condition(d) ); //Block until turn to run
 		
+		    // Remove current process from blocking arrray.
+                    d->blocked_processes[--d->num_blocked_processes] = 0;
+
+
 		    // Check if the current task received a signal before the above condition is true.
                     if(ret == -ERESTARTSYS) {
 			// If it is this task's turn in the wait queue,
@@ -376,11 +511,15 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
                         return ret; 
 			
                     }
-                
+        		 
+		    // Add current process to lock holding array.
+		    d->locked_processes[d->num_locked_processes++] = current->pid;
+		  
                     //Secure a read lock
                     d->num_read_locks++;
                     filp->f_flags |= F_OSPRD_LOCKED; 
-
+		
+							
                     //Let next request know it can start soon as this one releases the lock if the
                     //request is to write to disk. Let next request know it can start immediately
                     //if the request is to read from the disk
@@ -405,10 +544,14 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
                     if(!write_lock_condition(d))
                         r = -EBUSY;
                     else {
+		
+			// Add current process to lock holding array.
+		    	d->locked_processes[d->num_locked_processes++] = current->pid;
+
                         //Secure the write lock
                         d->num_write_locks++;
                         filp->f_flags |= F_OSPRD_LOCKED; 
- 
+ 		
                         //On success, write_lock_condition will not release the spin lock. Release it now
                         osp_spin_unlock(&d->mutex);
                     }
@@ -416,6 +559,10 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
                     if(!read_lock_condition(d))
                         r = -EBUSY;
                     else {
+
+			// Add current process to lock holding array.
+		    	d->locked_processes[d->num_locked_processes++] = current->pid;
+		  
                         //Secure a read lock
                         d->num_read_locks++;
                         filp->f_flags |= F_OSPRD_LOCKED; 
@@ -440,6 +587,9 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
                 osp_spin_lock(&d->mutex);
                 filp->f_flags &= ~F_OSPRD_LOCKED;
                      
+		// Remove current process from the lock holding array.
+		d->locked_processes[--d->num_locked_processes] = 0;
+
                 if(filp_writable) 
                     d->num_write_locks--;
                 else
@@ -466,11 +616,14 @@ static void osprd_setup(osprd_info_t *d)
 	/* Add code here if you add fields to osprd_info_t. */
         d->num_read_locks = 0;
         d->num_write_locks = 0;
-	
+	d->num_blocked_processes = 0;
+	d->num_locked_processes = 0;
 	// Initialize dead ticket array to all 0's.
 	int i = 0;
 	for(i = 0; i < MAX_TICKET_SIZE; i++) {
 		d->dead_ticket[i] = 0;	
+		d->blocked_processes[i] = 0;
+		d->locked_processes[i] = 0;
 	}
 	
 }
